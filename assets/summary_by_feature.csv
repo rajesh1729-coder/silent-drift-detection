@@ -1,0 +1,9 @@
+target_feature,Precision@1,Recall@3,Avg_Rank,Avg_PSI
+congestion_surcharge,1.0,1.0,1.0,0.0
+extra,1.0,1.0,1.0,0.0
+fare_amount,1.0,1.0,1.0,3.74189348833515
+passenger_count,1.0,1.0,1.0,20.987727394236174
+payment_type,1.0,1.0,1.0,21.816302787397227
+speed_mph,1.0,1.0,1.0,2.0446383674643767
+trip_distance,1.0,1.0,1.0,3.83031195595582
+trip_duration_min,1.0,1.0,1.0,3.7838569894854803
