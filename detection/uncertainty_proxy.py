@@ -1,4 +1,4 @@
-"""
+r"""
 Uncertainty-Based and Unsupervised Silent Drift Detectors.
 
 The Label Delay Problem:
@@ -23,7 +23,7 @@ Solution: Unsupervised Confidence & Manifold Proxies
    When inputs land in dense, well-sampled regions of the reference manifold, decision trees
    agree closely (low variance). When inputs shift out-of-distribution, trees extrapolate
    wildly along divergent split trajectories (high epistemic uncertainty).
-"""
+r"""
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Union
@@ -53,10 +53,10 @@ class UncertaintyReport:
 
 
 class UncertaintyDriftDetector:
-    """
+    r"""
     Monitors model prediction distribution and epistemic uncertainty to detect silent drift
     without requiring ground truth labels.
-    """
+    r"""
 
     def __init__(
         self,
@@ -84,7 +84,7 @@ class UncertaintyDriftDetector:
         ref_uncertainties: np.ndarray,
         ref_features: Optional[np.ndarray] = None,
     ) -> "UncertaintyDriftDetector":
-        """Establishes reference distributions for predictions, tree variances, and manifold distances."""
+        r"""Establishes reference distributions for predictions, tree variances, and manifold distances."""
         self.ref_predictions = np.asarray(ref_predictions, dtype=float)
         self.ref_uncertainties = np.asarray(ref_uncertainties, dtype=float)
 
@@ -109,7 +109,7 @@ class UncertaintyDriftDetector:
         prod_uncertainties: np.ndarray,
         prod_features: Optional[np.ndarray] = None,
     ) -> UncertaintyReport:
-        """Evaluates production batch against reference uncertainty baseline."""
+        r"""Evaluates production batch against reference uncertainty baseline."""
         if not self.is_fitted:
             raise RuntimeError("Detector must be fitted on reference data first.")
 

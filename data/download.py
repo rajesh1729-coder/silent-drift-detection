@@ -62,7 +62,7 @@ def generate_synthetic_taxi_fallback(
 
         # Temporal timestamps over 30 days
         seconds_offset = np.random.uniform(0, 30 * 86400, size=n_samples_per_window)
-        pickup_times = base_time + pd.to_timedelta(seconds_offset, unit="s")
+        pickup_times = pd.Series(base_time + pd.to_timedelta(seconds_offset, unit="s"))
         hour = pickup_times.dt.hour.to_numpy()
         day_of_week = pickup_times.dt.dayofweek.to_numpy()
         is_weekend = (day_of_week >= 5).astype(int)

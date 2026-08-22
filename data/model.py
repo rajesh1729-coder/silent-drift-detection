@@ -1,5 +1,6 @@
 """
 Baseline Model Training and Inference with Uncertainty Estimation.
+Uses Gradient Boosted Trees with staged prediction variance estimation.
 """
 
 import os
@@ -9,10 +10,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 
-import lightgbm as lgb
 from .preprocess import ALL_MODEL_FEATURES, TARGET_COLUMN
 
 logger = logging.getLogger(__name__)
@@ -20,42 +21,35 @@ logger = logging.getLogger(__name__)
 
 class BaselineTaxiModel:
     """
-    Production LightGBM Regressor for predicting NYC Taxi Tip Amounts ($).
-    Equipped with tree-ensemble variance estimators for silent/uncertainty drift detection.
+    Production Gradient Boosted Regressor for predicting NYC Taxi Tip Amounts ($).
+    Equipped with staged tree-ensemble variance estimators for silent/uncertainty drift detection.
     """
 
     def __init__(
         self,
         features: Optional[List[str]] = None,
         target_col: str = TARGET_COLUMN,
-        n_estimators: int = 120,
-        learning_rate: float = 0.05,
-        max_depth: int = 6,
-        num_leaves: int = 31,
+        n_estimators: int = 80,
+        learning_rate: float = 0.08,
+        max_depth: int = 5,
         random_state: int = 42,
     ):
         self.features = features or ALL_MODEL_FEATURES
         self.target_col = target_col
         self.params = {
-            "objective": "regression",
-            "metric": "rmse",
-            "boosting_type": "gbdt",
             "n_estimators": n_estimators,
             "learning_rate": learning_rate,
             "max_depth": max_depth,
-            "num_leaves": num_leaves,
             "random_state": random_state,
-            "verbose": -1,
-            "n_jobs": -1,
         }
-        self.model: Optional[lgb.LGBMRegressor] = None
+        self.model: Optional[GradientBoostingRegressor] = None
         self.reference_metrics: Dict[str, float] = {}
         self.reference_predictions: Optional[np.ndarray] = None
         self.reference_residuals: Optional[np.ndarray] = None
         self.reference_uncertainties: Optional[np.ndarray] = None
 
     def fit(self, train_df: pd.DataFrame, val_df: Optional[pd.DataFrame] = None) -> "BaselineTaxiModel":
-        """Trains LightGBM model on reference features and records baseline metrics."""
+        """Trains Gradient Boosted model on reference features and records baseline metrics."""
         X_train = train_df[self.features]
         y_train = train_df[self.target_col]
 
@@ -65,14 +59,9 @@ class BaselineTaxiModel:
             X_tr, y_tr = X_train, y_train
             X_val, y_val = val_df[self.features], val_df[self.target_col]
 
-        logger.info("Training LightGBM model on %d samples with %d features...", len(X_tr), len(self.features))
-        self.model = lgb.LGBMRegressor(**self.params)
-        self.model.fit(
-            X_tr,
-            y_tr,
-            eval_set=[(X_val, y_val)],
-            callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)],
-        )
+        logger.info("Training Gradient Boosting model on %d samples with %d features...", len(X_tr), len(self.features))
+        self.model = GradientBoostingRegressor(**self.params)
+        self.model.fit(X_tr, y_tr)
 
         # Baseline evaluation on validation split
         val_preds = self.model.predict(X_val)
@@ -105,34 +94,30 @@ class BaselineTaxiModel:
 
     def estimate_uncertainty(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Estimates epistemic prediction uncertainty via tree ensemble leaf variance.
+        Estimates epistemic prediction uncertainty via staged tree ensemble variance.
         
         Statistical principle:
         For an input vector x, the booster contains T individual decision trees.
-        When x lands in familiar reference space, all trees agree closely on leaf predictions.
+        When x lands in familiar reference space, staged predictions converge smoothly.
         When x shifts into out-of-distribution / drifted space, trees extrapolate diverge,
-        producing a spike in ensemble standard deviation:
+        producing a spike in ensemble standard deviation across stages:
             sigma_tree(x) = sqrt( 1/T * sum_{t=1}^T (f_t(x) - f_bar(x))^2 )
         """
-        if self.model is None or self.model.booster_ is None:
-            raise RuntimeError("Model booster not initialized.")
+        if self.model is None:
+            raise RuntimeError("Model not initialized.")
 
         X = df[self.features] if isinstance(df, pd.DataFrame) else df
-        booster = self.model.booster_
+        # Collect staged predictions sampled across boosting iterations
+        staged_preds = []
+        for idx, p in enumerate(self.model.staged_predict(X)):
+            if idx % max(1, self.model.n_estimators_ // 15) == 0:
+                staged_preds.append(p)
 
-        # Fast calculation of tree individual leaf predictions across iterations
-        # LightGBM booster.predict with raw_score or per-tree predictions
-        leaf_indices = booster.predict(X, pred_leaf=True)
-        # Compute leaf variance across trees
-        tree_preds = []
-        n_trees = booster.num_trees()
-        step = max(1, n_trees // 20)  # sample 20 trees for fast inference
-        for t in range(0, n_trees, step):
-            p_t = booster.predict(X, num_iteration=t+1)
-            tree_preds.append(p_t)
+        if not staged_preds:
+            staged_preds.append(self.model.predict(X))
 
-        tree_matrix = np.array(tree_preds)  # shape (n_sample_trees, n_rows)
-        uncertainty_std = np.std(tree_matrix, axis=0)
+        staged_matrix = np.array(staged_preds)  # shape (n_stages, n_samples)
+        uncertainty_std = np.std(staged_matrix, axis=0)
         return uncertainty_std
 
     def evaluate(self, df: pd.DataFrame) -> Dict[str, float]:
