@@ -1,0 +1,40 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+
+# Large Datasets and Cache (Data download script downloads on demand)
+data/raw/
+data/cache/
+*.parquet
+*.csv.gz
+*.tar.gz
+*.zip
+
+# Model Checkpoints & Large Artifacts
+models/*.pkl
+models/*.joblib
+models/*.onnx
+!models/.gitkeep
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Streamlit runtime
+.streamlit/
