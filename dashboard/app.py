@@ -178,7 +178,7 @@ with tab1:
             "Wasserstein Dist": round(met.wasserstein_dist, 4),
             "Overall Status": met.status,
         })
-    df_scorecard = pd.DataFrame(table_rows).sort_values(by="PSI Score", reverse=True)
+    df_scorecard = pd.DataFrame(table_rows).sort_values(by="PSI Score", ascending=False)
     st.dataframe(df_scorecard, use_container_width=True, hide_index=True)
 
 # -------------------------------------------------------------
