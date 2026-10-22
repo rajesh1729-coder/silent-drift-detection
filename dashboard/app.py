@@ -96,7 +96,7 @@ window_options = [w for w in proc_windows.keys() if w != ref_key]
 selected_window = st.sidebar.selectbox("Select Production Window", window_options, index=1)
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Reference Baseline (W0)")
-st.sidebar.info(f"Trained on {len(ref_df):,} samples with LightGBM. Baseline RMSE: ${model.reference_metrics['rmse']:.2f}")
+st.sidebar.info(f"Reference window: {len(ref_df):,} rows. Model: scikit-learn GradientBoostingRegressor, trained on 80% ({int(len(ref_df) * 0.8):,} rows). Baseline RMSE ${model.reference_metrics['rmse']:.2f}, measured on the other 20%.")
 
 # Tabs
 tab1, tab2, tab3, tab4 = st.tabs([
