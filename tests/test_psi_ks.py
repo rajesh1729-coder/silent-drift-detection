@@ -115,7 +115,6 @@ def test_benjamini_hochberg_fdr_control():
     # The null features must NOT be rejected
     assert results["null_1"][0] is False
     assert results["null_2"][0] is False
-<<<<<<< HEAD
 def test_psi_detects_values_outside_reference_range():
     """Regression: production data entirely outside the reference range used to give PSI = 0."""
     rng = np.random.default_rng(1)
@@ -141,5 +140,3 @@ def test_psi_low_cardinality_numeric_feature_is_not_blind():
     prod = rng.choice([0.0, 1.0], size=5000, p=[0.5, 0.5])
     res = calculate_psi_numerical(ref, prod)
     assert res.psi_value >= 0.25
-=======
->>>>>>> be06c2c12d5b17e89c914af34213b784c02084e7

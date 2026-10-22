@@ -81,14 +81,10 @@ def calculate_psi_numerical(
         psi = 0.0 if prod_same > 0.99 else 1.0
         status = "CRITICAL" if psi >= 0.25 else "STABLE"
         return PSIBinningResult(psi, np.array([ref_clean[0]]), np.array([1.0]), np.array([prod_same]), np.array([psi]), status)
-<<<<<<< HEAD
         # Low-cardinality numeric features (0/1 flags, a few fixed fees) collapse to a
     # single quantile bin, which makes PSI always 0. Treat them as discrete categories.
     if len(np.unique(ref_clean)) <= n_bins:
         return calculate_psi_categorical(ref_clean, prod_clean, epsilon=epsilon)
-=======
-
->>>>>>> be06c2c12d5b17e89c914af34213b784c02084e7
     # Derive bin edges from reference quantiles if not provided
     if bin_edges is None:
         quantiles = np.linspace(0, 100, n_bins + 1)
@@ -101,17 +97,11 @@ def calculate_psi_numerical(
             bin_edges[0] -= 1e-5
             bin_edges[-1] += 1e-5
 
-<<<<<<< HEAD
         # Count with open-ended outer bins: production values outside the reference
     # range must land in the first/last bin instead of silently disappearing.
     counting_edges = np.concatenate(([-np.inf], bin_edges[1:-1], [np.inf]))
     ref_counts, _ = np.histogram(ref_clean, bins=counting_edges)
     prod_counts, _ = np.histogram(prod_clean, bins=counting_edges)
-=======
-    # Compute empirical bucket counts
-    ref_counts, _ = np.histogram(ref_clean, bins=bin_edges)
-    prod_counts, _ = np.histogram(prod_clean, bins=bin_edges)
->>>>>>> be06c2c12d5b17e89c914af34213b784c02084e7
 
     # Convert to probability mass distributions
     ref_props = ref_counts / len(ref_clean)
