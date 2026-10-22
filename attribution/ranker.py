@@ -3,10 +3,9 @@ Unified Root-Cause Attribution Engine.
 Combines SHAP marginal distribution shift with Causal Counterfactual Ablation.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import logging
-from typing import Dict, List, Optional, Tuple, Union
-import numpy as np
+from typing import Dict, List, Optional
 import pandas as pd
 
 from .shap_attribution import SHAPDriftAttributor, SHAPAttributionResult
@@ -78,6 +77,7 @@ class DriftAttributionEngine:
         prod_df: pd.DataFrame,
         drift_report: Optional[DriftReport] = None,
         target_col: Optional[str] = None,
+        restrict_to_flagged: bool = False,
     ) -> UnifiedAttributionReport:
         """
         Executes unified attribution pipeline on the drifted production window.
@@ -88,15 +88,14 @@ class DriftAttributionEngine:
         window_name = drift_report.window_name if drift_report else "production_batch"
         alert_status = drift_report.overall_status if drift_report else "WARNING"
 
-        # Determine suspect candidate features
+        # Determine suspect candidate features if explicitly restricting to flagged features
         candidate_features = None
-        if drift_report is not None and drift_report.n_drifted_features > 0:
+        if restrict_to_flagged and drift_report is not None and drift_report.n_drifted_features > 0:
             candidate_features = [
                 f for f, m in drift_report.feature_metrics.items()
                 if m.status in ("WARNING", "CRITICAL")
             ]
-        
-        # Fallback to all features if none flagged or candidate list empty
+
         if not candidate_features:
             candidate_features = self.model_wrapper.features
 
@@ -117,9 +116,10 @@ class DriftAttributionEngine:
         for feat in features:
             s_score = shap_res.relative_attribution_share.get(feat, 0.0)
             c_score = causal_res.prediction_recovery_scores.get(feat, 0.0)
-            
-            # If error recovery is available from labels, blend with error recovery
-            if target_col and feat in causal_res.error_recovery_scores:
+
+            if target_col and feat in causal_res.error_recovery_scores and any(
+                v > 0.05 for v in causal_res.error_recovery_scores.values()
+            ):
                 c_err = causal_res.error_recovery_scores[feat]
                 c_effective = 0.5 * c_score + 0.5 * c_err
             else:
@@ -128,12 +128,10 @@ class DriftAttributionEngine:
             score = (self.shap_weight * s_score) + (self.causal_weight * c_effective)
             combined_scores[feat] = float(score)
 
-        # Sort features by combined score
         sorted_ranks = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
         top_feature = sorted_ranks[0][0]
         top_3_features = [x[0] for x in sorted_ranks[:3]]
 
-        # Build feature summaries
         summaries: Dict[str, FeatureAttributionSummary] = {}
         for rank_idx, (feat, score) in enumerate(sorted_ranks, start=1):
             psi_val = 0.0
@@ -148,7 +146,6 @@ class DriftAttributionEngine:
             c_pred = causal_res.prediction_recovery_scores.get(feat, 0.0)
             c_err = causal_res.error_recovery_scores.get(feat, 0.0)
 
-            # Generate narrative
             if rank_idx == 1:
                 narrative = (
                     f"PRIMARY ROOT CAUSE: Feature '{feat}' accounts for {shap_share*100:.1f}% of SHAP shift "

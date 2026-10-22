@@ -2,9 +2,9 @@
 Unified Multi-Signal Drift Detection Orchestrator.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
@@ -14,7 +14,6 @@ from .statistical_tests import (
     calculate_ks_test,
     apply_benjamini_hochberg_correction,
     calculate_wasserstein_distance,
-    PSIBinningResult,
 )
 from .uncertainty_proxy import UncertaintyDriftDetector, UncertaintyReport
 
@@ -33,13 +32,12 @@ class FeatureDriftMetric:
     ks_fdr_qvalue: float
     wasserstein_dist: float
     status: str  # "STABLE", "WARNING", "CRITICAL"
-    ks_status: str = "STABLE"  # raw KS verdict before FDR gating ("STABLE" for categoricals)
+    ks_status: str = "STABLE"
 
 
 def combine_feature_status(psi_status: str, ks_status: str, ks_fdr_significant: bool) -> str:
     """
     Decide one feature's final status.
-
     PSI always counts. The KS verdict only counts if the Benjamini-Hochberg
     procedure also found that feature's KS test significant.
     """
@@ -67,8 +65,6 @@ class DriftReport:
 class DriftDetector:
     """
     Production-grade multi-signal drift detection orchestrator.
-    Combines input feature PSI, KS-testing with Benjamini-Hochberg FDR control,
-    prediction drift, and epistemic uncertainty proxies.
     """
 
     def __init__(
@@ -85,10 +81,13 @@ class DriftDetector:
         self.psi_warn = psi_threshold_warning
         self.psi_crit = psi_threshold_critical
         self.ks_alpha = ks_alpha
-        self.uncertainty_detector = uncertainty_detector or UncertaintyDriftDetector()
+        self.uncertainty_detector = uncertainty_detector or UncertaintyDriftDetector(
+            psi_threshold_warning=psi_threshold_warning,
+            psi_threshold_critical=psi_threshold_critical,
+        )
 
         self.ref_data: Optional[pd.DataFrame] = None
-        self.ref_bin_edges: Dict[str, np.ndarray] = {}
+        self.ref_bin_edges: Dict[str, Optional[np.ndarray]] = {}
         self.is_fitted = False
 
     def fit_reference(
@@ -100,20 +99,32 @@ class DriftDetector:
         """Pre-computes quantile bin edges and baseline distributions on Reference Window W0."""
         self.ref_data = ref_df.copy()
 
-        # Cache reference bin edges for all numerical features
         for feat in self.numerical_features:
             if feat in ref_df.columns:
-                res = calculate_psi_numerical(ref_df[feat], ref_df[feat], n_bins=10)
-                self.ref_bin_edges[feat] = res.bin_edges
+                clean_col = ref_df[feat].dropna()
+                if len(clean_col.unique()) > 10:
+                    res = calculate_psi_numerical(
+                        ref_df[feat],
+                        ref_df[feat],
+                        n_bins=10,
+                        warn_threshold=self.psi_warn,
+                        crit_threshold=self.psi_crit,
+                    )
+                    self.ref_bin_edges[feat] = res.bin_edges
+                else:
+                    self.ref_bin_edges[feat] = None
 
-        # Fit uncertainty detector if predictions are provided
         if ref_predictions is not None and ref_uncertainties is not None:
             all_feats = self.numerical_features + self.categorical_features
             ref_feat_arr = ref_df[all_feats].to_numpy() if all(c in ref_df.columns for c in all_feats) else None
             self.uncertainty_detector.fit_reference(ref_predictions, ref_uncertainties, ref_feat_arr)
 
         self.is_fitted = True
-        logger.info("DriftDetector fitted on reference data (%d samples, %d features).", len(ref_df), len(self.numerical_features) + len(self.categorical_features))
+        logger.info(
+            "DriftDetector fitted on reference data (%d samples, %d features).",
+            len(ref_df),
+            len(self.numerical_features) + len(self.categorical_features),
+        )
         return self
 
     def inspect_window(
@@ -124,23 +135,26 @@ class DriftDetector:
         prod_uncertainties: Optional[np.ndarray] = None,
         supervised_metrics: Optional[Dict[str, float]] = None,
     ) -> DriftReport:
-        """
-        Executes full statistical detection suite across input features,
-        model predictions, and uncertainty proxies.
-        """
+        """Executes full statistical detection suite across input features, predictions, and uncertainty."""
         if not self.is_fitted or self.ref_data is None:
             raise RuntimeError("DriftDetector must be fitted on reference data first.")
 
         feature_metrics: Dict[str, FeatureDriftMetric] = {}
         raw_pvalues: Dict[str, float] = {}
 
-        # 1. Evaluate Numerical Features (PSI + KS test + Wasserstein)
+        # 1. Evaluate Numerical Features
         for feat in self.numerical_features:
             if feat not in prod_df.columns or feat not in self.ref_data.columns:
                 continue
 
             bin_edges = self.ref_bin_edges.get(feat)
-            psi_res = calculate_psi_numerical(self.ref_data[feat], prod_df[feat], bin_edges=bin_edges)
+            psi_res = calculate_psi_numerical(
+                self.ref_data[feat],
+                prod_df[feat],
+                bin_edges=bin_edges,
+                warn_threshold=self.psi_warn,
+                crit_threshold=self.psi_crit,
+            )
             ks_stat, ks_pval, ks_status = calculate_ks_test(self.ref_data[feat], prod_df[feat])
             raw_pvalues[feat] = ks_pval
             wass_dist = calculate_wasserstein_distance(self.ref_data[feat], prod_df[feat])
@@ -152,10 +166,10 @@ class DriftDetector:
                 psi_status=psi_res.status,
                 ks_statistic=ks_stat,
                 ks_pvalue=ks_pval,
-                ks_fdr_significant=False,  # updated via BH step
+                ks_fdr_significant=False,
                 ks_fdr_qvalue=ks_pval,
                 wasserstein_dist=wass_dist,
-                status=psi_res.status,  # placeholder, finalized after the BH step
+                status=psi_res.status,
                 ks_status=ks_status,
             )
 
@@ -168,12 +182,17 @@ class DriftDetector:
                 m.ks_fdr_qvalue = q_val
                 m.status = combine_feature_status(m.psi_status, m.ks_status, is_sig)
 
-        # 3. Evaluate Categorical Features (Categorical PSI)
+        # 3. Evaluate Categorical Features
         for feat in self.categorical_features:
             if feat not in prod_df.columns or feat not in self.ref_data.columns:
                 continue
 
-            psi_res = calculate_psi_categorical(self.ref_data[feat], prod_df[feat])
+            psi_res = calculate_psi_categorical(
+                self.ref_data[feat],
+                prod_df[feat],
+                warn_threshold=self.psi_warn,
+                crit_threshold=self.psi_crit,
+            )
             feature_metrics[feat] = FeatureDriftMetric(
                 feature_name=feat,
                 feature_type="categorical",
@@ -200,7 +219,7 @@ class DriftDetector:
         critical_count = len(critical_feats)
         warning_count = len(warning_feats)
         drifted_total = critical_count + warning_count
-        unc_status = unc_report.alert_status if unc_report else "NORMAL"
+        unc_status = unc_report.alert_status if unc_report else "STABLE"
 
         def _names(feats: List[str]) -> str:
             shown = ", ".join(feats[:5])
@@ -214,14 +233,14 @@ class DriftDetector:
             if warning_count:
                 parts.append(f"{warning_count} warning feature(s)")
             summary = "CRITICAL ALERT: " + ("; ".join(parts) if parts else "model signals only") + "."
-            if unc_status == "CRITICAL":
+            if unc_status == "CRITICAL" and unc_report is not None:
                 summary += f" Model uncertainty/prediction drift critical ({unc_report.justification})."
         elif warning_count > 0 or unc_status == "WARNING":
             overall_status = "WARNING"
             summary = "WARNING:"
             if warning_count:
                 summary += f" {warning_count} feature(s) with moderate drift: {_names(warning_feats)}."
-            if unc_status == "WARNING":
+            if unc_status == "WARNING" and unc_report is not None:
                 summary += f" Model uncertainty/prediction drift warning ({unc_report.justification})."
         else:
             overall_status = "NORMAL"

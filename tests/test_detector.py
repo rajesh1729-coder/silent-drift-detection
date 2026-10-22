@@ -63,3 +63,13 @@ def test_summary_names_the_critical_features_and_has_no_hardcoded_psi_claim():
     assert rep.overall_status == "CRITICAL"
     assert "x" in rep.summary
     assert "PSI >= 0.25" not in rep.summary
+
+
+def test_custom_psi_thresholds_are_respected():
+    """Custom PSI warning and critical thresholds must override 0.10/0.25 defaults."""
+    ref, prod = _make_frames(shift=0.25, seed=10)
+    strict_det = DriftDetector(
+        ["x"], [], psi_threshold_warning=0.01, psi_threshold_critical=0.03
+    ).fit_reference(ref)
+    rep = strict_det.inspect_window(prod)
+    assert rep.feature_metrics["x"].psi_status == "CRITICAL"

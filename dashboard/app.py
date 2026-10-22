@@ -6,7 +6,6 @@ Built with Streamlit and Plotly for interactive production monitoring.
 import sys
 from pathlib import Path
 
-# Add project root to sys.path
 root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
@@ -16,17 +15,15 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 from data.download import fetch_taxi_data
 from data.preprocess import prepare_drift_datasets, ALL_MODEL_FEATURES, NUMERICAL_FEATURES, CATEGORICAL_FEATURES
-from data.model import BaselineTaxiModel, train_baseline_model
+from data.model import BaselineTaxiModel
 from detection.detector import DriftDetector
 from attribution.ranker import DriftAttributionEngine
 from validation.drift_injector import SyntheticDriftInjector, DriftType
-from validation.benchmark import AttributionBenchmarkRunner
+from validation.benchmark import make_fresh_heldout
 
-# Configure Streamlit page
 st.set_page_config(
     page_title="Silent Drift Detection & Attribution",
     page_icon="🛡️",
@@ -45,7 +42,7 @@ st.markdown(
 )
 
 
-@st.cache_resource(show_spinner="Initializing datasets and training baseline LightGBM model...")
+@st.cache_resource(show_spinner="Initializing datasets and training baseline Gradient Boosting model...")
 def load_system_state():
     raw_windows = fetch_taxi_data(samples_per_month=15000, force_synthetic=True)
     pipeline, proc_windows = prepare_drift_datasets(raw_windows)
@@ -53,11 +50,9 @@ def load_system_state():
     ref_key = list(proc_windows.keys())[0]
     ref_df = proc_windows[ref_key]
 
-    # Train model
     model = BaselineTaxiModel()
     model.fit(ref_df)
 
-    # Initialize Detector
     detector = DriftDetector(
         numerical_features=NUMERICAL_FEATURES,
         categorical_features=CATEGORICAL_FEATURES,
@@ -66,9 +61,10 @@ def load_system_state():
     ref_uncs = model.estimate_uncertainty(ref_df)
     detector.fit_reference(ref_df, ref_preds, ref_uncs)
 
-    # Initialize Attribution Engine
     attributor = DriftAttributionEngine(model_wrapper=model, max_samples=1500)
     attributor.fit_reference(ref_df)
+
+    fresh_heldout = make_fresh_heldout(pipeline, n_samples=4000, random_seed=777)
 
     return {
         "raw_windows": raw_windows,
@@ -79,6 +75,7 @@ def load_system_state():
         "attributor": attributor,
         "ref_key": ref_key,
         "ref_df": ref_df,
+        "fresh_heldout": fresh_heldout,
     }
 
 
@@ -89,24 +86,34 @@ detector = state["detector"]
 attributor = state["attributor"]
 ref_key = state["ref_key"]
 ref_df = state["ref_df"]
+fresh_heldout = state["fresh_heldout"]
 
 # Sidebar configuration
 st.sidebar.header("⚙️ Monitoring Settings")
 window_options = [w for w in proc_windows.keys() if w != ref_key]
 selected_window = st.sidebar.selectbox("Select Production Window", window_options, index=1)
+use_delayed_labels = st.sidebar.checkbox(
+    "Simulate Delayed Labels Arrived",
+    value=False,
+    help="By default, attribution runs in zero-label mode. Enable to simulate delayed ground-truth arrival.",
+)
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Reference Baseline (W0)")
-st.sidebar.info(f"Reference window: {len(ref_df):,} rows. Model: scikit-learn GradientBoostingRegressor, trained on 80% ({int(len(ref_df) * 0.8):,} rows). Baseline RMSE ${model.reference_metrics['rmse']:.2f}, measured on the other 20%.")
+st.sidebar.info(
+    f"Reference window: {len(ref_df):,} rows. Model: GradientBoostingRegressor, "
+    f"trained on 80% ({int(len(ref_df) * 0.8):,} rows). "
+    f"Baseline RMSE ${model.reference_metrics['rmse']:.2f} on held-out 20%."
+)
 
-# Tabs
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 Production Timeline",
-    "🔍 Root-Cause Attribution Deep Dive",
-    "🧪 Synthetic Drift Injection Lab",
-    "🏆 Validation Benchmark",
-])
+tab1, tab2, tab3, tab4 = st.tabs(
+    [
+        "📊 Production Timeline",
+        "🔍 Root-Cause Attribution Deep Dive",
+        "🧪 Synthetic Drift Injection Lab",
+        "🏆 Validation Benchmark",
+    ]
+)
 
-# Compute current window predictions & drift report
 prod_df = proc_windows[selected_window]
 prod_preds = model.predict(prod_df)
 prod_uncs = model.estimate_uncertainty(prod_df)
@@ -116,7 +123,11 @@ drift_rep = detector.inspect_window(
     prod_predictions=prod_preds,
     prod_uncertainties=prod_uncs,
 )
-attr_rep = attributor.attribute_drift(prod_df, drift_report=drift_rep, target_col=model.target_col)
+attr_rep = attributor.attribute_drift(
+    prod_df,
+    drift_report=drift_rep,
+    target_col=model.target_col if use_delayed_labels else None,
+)
 
 # -------------------------------------------------------------
 # TAB 1: PRODUCTION TIMELINE & MULTI-SIGNAL MONITORING
@@ -124,20 +135,20 @@ attr_rep = attributor.attribute_drift(prod_df, drift_report=drift_rep, target_co
 with tab1:
     st.subheader(f"Window Assessment: `{selected_window}`")
 
-    # KPI Banner
     col1, col2, col3, col4 = st.columns(4)
-    status_color = "🔴" if drift_rep.overall_status == "CRITICAL" else ("🟡" if drift_rep.overall_status == "WARNING" else "🟢")
+    status_color = (
+        "🔴" if drift_rep.overall_status == "CRITICAL" else ("🟡" if drift_rep.overall_status == "WARNING" else "🟢")
+    )
     col1.metric("Overall Alert Status", f"{status_color} {drift_rep.overall_status}")
     col2.metric("Flagged Features (PSI or KS)", f"{drift_rep.n_drifted_features} / {len(drift_rep.feature_metrics)}")
-    
+
     unc_ratio = drift_rep.uncertainty_report.uncertainty_mean_ratio if drift_rep.uncertainty_report else 1.0
     col3.metric("Epistemic Uncertainty Shift", f"{unc_ratio:.2f}x Baseline")
-    
+
     pred_psi = drift_rep.uncertainty_report.pred_psi if drift_rep.uncertainty_report else 0.0
     col4.metric("Prediction Output PSI", f"{pred_psi:.4f}")
 
     st.markdown(f"**Alert Justification:** {drift_rep.summary}")
-
     st.markdown("---")
 
     col_left, col_right = st.columns([1, 1])
@@ -148,36 +159,86 @@ with tab1:
         prod_preds_sample = prod_preds[:3000]
 
         fig_pred = go.Figure()
-        fig_pred.add_trace(go.Histogram(x=ref_preds_sample, name="Reference W0", opacity=0.6, marker_color="#1f77b4", histnorm="probability density"))
-        fig_pred.add_trace(go.Histogram(x=prod_preds_sample, name=f"Prod {selected_window}", opacity=0.6, marker_color="#d62728", histnorm="probability density"))
-        fig_pred.update_layout(barmode="overlay", title="Predicted Tip ($) Density Overlay", xaxis_title="Predicted Tip ($)", yaxis_title="Density", margin=dict(l=20, r=20, t=40, b=20))
+        fig_pred.add_trace(
+            go.Histogram(
+                x=ref_preds_sample,
+                name="Reference W0",
+                opacity=0.6,
+                marker_color="#1f77b4",
+                histnorm="probability density",
+            )
+        )
+        fig_pred.add_trace(
+            go.Histogram(
+                x=prod_preds_sample,
+                name=f"Prod {selected_window}",
+                opacity=0.6,
+                marker_color="#d62728",
+                histnorm="probability density",
+            )
+        )
+        fig_pred.update_layout(
+            barmode="overlay",
+            title="Predicted Tip ($) Density Overlay",
+            xaxis_title="Predicted Tip ($)",
+            yaxis_title="Density",
+            margin=dict(l=20, r=20, t=40, b=20),
+        )
         st.plotly_chart(fig_pred, use_container_width=True)
 
     with col_right:
         st.markdown("#### 🔬 Epistemic Uncertainty Distribution Shift")
-        ref_unc_sample = model.reference_uncertainties[:3000] if model.reference_uncertainties is not None else np.ones(3000)
+        ref_unc_sample = (
+            model.reference_uncertainties[:3000] if model.reference_uncertainties is not None else np.ones(3000)
+        )
         prod_unc_sample = prod_uncs[:3000]
 
         fig_unc = go.Figure()
-        fig_unc.add_trace(go.Histogram(x=ref_unc_sample, name="Reference W0", opacity=0.6, marker_color="#2ca02c", histnorm="probability density"))
-        fig_unc.add_trace(go.Histogram(x=prod_unc_sample, name=f"Prod {selected_window}", opacity=0.6, marker_color="#ff7f0e", histnorm="probability density"))
-        fig_unc.update_layout(barmode="overlay", title="Tree-Ensemble Uncertainty Standard Deviation", xaxis_title="Epistemic Uncertainty", yaxis_title="Density", margin=dict(l=20, r=20, t=40, b=20))
+        fig_unc.add_trace(
+            go.Histogram(
+                x=ref_unc_sample,
+                name="Reference W0",
+                opacity=0.6,
+                marker_color="#2ca02c",
+                histnorm="probability density",
+            )
+        )
+        fig_unc.add_trace(
+            go.Histogram(
+                x=prod_unc_sample,
+                name=f"Prod {selected_window}",
+                opacity=0.6,
+                marker_color="#ff7f0e",
+                histnorm="probability density",
+            )
+        )
+        fig_unc.update_layout(
+            barmode="overlay",
+            title="Tree-Ensemble Uncertainty Standard Deviation",
+            xaxis_title="Epistemic Uncertainty",
+            yaxis_title="Density",
+            margin=dict(l=20, r=20, t=40, b=20),
+        )
         st.plotly_chart(fig_unc, use_container_width=True)
 
     st.markdown("#### 📋 Feature-Level Statistical Drift Scorecard")
     table_rows = []
     for feat, met in drift_rep.feature_metrics.items():
-        table_rows.append({
-            "Feature": feat,
-            "Type": met.feature_type,
-            "PSI Score": round(met.psi_value, 4),
-            "PSI Status": met.psi_status,
-            "KS Statistic": round(met.ks_statistic, 4),
-            "KS p-value": f"{met.ks_pvalue:.2e}",
-            "FDR Sig (q < 0.01)": ("n/a" if met.feature_type == "categorical" else ("✅ Yes" if met.ks_fdr_significant else "❌ No")),
-            "Wasserstein Dist": round(met.wasserstein_dist, 4),
-            "Overall Status": met.status,
-        })
+        table_rows.append(
+            {
+                "Feature": feat,
+                "Type": met.feature_type,
+                "PSI Score": round(met.psi_value, 4),
+                "PSI Status": met.psi_status,
+                "KS Statistic": round(met.ks_statistic, 4),
+                "KS p-value": f"{met.ks_pvalue:.2e}",
+                "FDR Sig (q < 0.01)": (
+                    "n/a" if met.feature_type == "categorical" else ("✅ Yes" if met.ks_fdr_significant else "❌ No")
+                ),
+                "Wasserstein Dist": round(met.wasserstein_dist, 4),
+                "Overall Status": met.status,
+            }
+        )
     df_scorecard = pd.DataFrame(table_rows).sort_values(by="PSI Score", ascending=False)
     st.dataframe(df_scorecard, use_container_width=True, hide_index=True)
 
@@ -192,18 +253,23 @@ with tab2:
 
     st.success(f"🎯 **Identified Root Cause:** `{top_feat}` (Composite Attribution Score: **{top_score:.3f}**)")
     st.markdown(f"**Executive Diagnostic:** {attr_rep.executive_summary}")
-
     st.markdown("---")
 
     c1, c2 = st.columns([1, 1])
 
     with c1:
         st.markdown("#### 1️⃣ SHAP Distribution Shift Decomposition")
-        st.caption("Decomposes shift in mean model prediction into additive SHAP feature contributions ($\\Delta \\bar{\\phi}_j$).")
-        
+        st.caption(
+            "Decomposes shift in mean model prediction into additive SHAP feature contributions ($\\Delta \\bar{\\phi}_j$)."
+        )
+
         shap_deltas = attr_rep.shap_attribution.delta_mean_shaps
-        df_shap = pd.DataFrame(list(shap_deltas.items()), columns=["Feature", "Delta_SHAP"]).sort_values(by="Delta_SHAP", key=abs, ascending=True).tail(10)
-        
+        df_shap = (
+            pd.DataFrame(list(shap_deltas.items()), columns=["Feature", "Delta_SHAP"])
+            .sort_values(by="Delta_SHAP", key=abs, ascending=True)
+            .tail(10)
+        )
+
         fig_shap = px.bar(
             df_shap,
             x="Delta_SHAP",
@@ -218,10 +284,16 @@ with tab2:
 
     with c2:
         st.markdown("#### 2️⃣ Causal Counterfactual Ablation Impact")
-        st.caption("Measures percentage of drift closed when intervening on feature to restore reference marginal distribution.")
-        
+        st.caption(
+            "Measures percentage of drift closed when intervening on feature to restore reference marginal distribution."
+        )
+
         causal_scores = attr_rep.causal_ablation.prediction_recovery_scores
-        df_causal = pd.DataFrame(list(causal_scores.items()), columns=["Feature", "Causal_Recovery"]).sort_values(by="Causal_Recovery", ascending=True).tail(10)
+        df_causal = (
+            pd.DataFrame(list(causal_scores.items()), columns=["Feature", "Causal_Recovery"])
+            .sort_values(by="Causal_Recovery", ascending=True)
+            .tail(10)
+        )
         df_causal["Causal_Recovery_Pct"] = df_causal["Causal_Recovery"] * 100.0
 
         fig_causal = px.bar(
@@ -238,31 +310,54 @@ with tab2:
 
     st.markdown("---")
     st.markdown(f"#### 🔍 Marginal Distribution Overlay for Root Cause: `{top_feat}`")
-    
+
     col_dist1, col_dist2 = st.columns([1, 1])
-    
+
     with col_dist1:
         ref_feat_vals = ref_df[top_feat].dropna().to_numpy()
         prod_feat_vals = prod_df[top_feat].dropna().to_numpy()
-        
+
         fig_marginal = go.Figure()
-        fig_marginal.add_trace(go.Histogram(x=ref_feat_vals[:3000], name="Reference W0", opacity=0.6, marker_color="#1f77b4", histnorm="probability density"))
-        fig_marginal.add_trace(go.Histogram(x=prod_feat_vals[:3000], name=f"Prod {selected_window}", opacity=0.6, marker_color="#d62728", histnorm="probability density"))
-        fig_marginal.update_layout(barmode="overlay", title=f"Empirical Density Shift for '{top_feat}'", xaxis_title=top_feat, yaxis_title="Density")
+        fig_marginal.add_trace(
+            go.Histogram(
+                x=ref_feat_vals[:3000],
+                name="Reference W0",
+                opacity=0.6,
+                marker_color="#1f77b4",
+                histnorm="probability density",
+            )
+        )
+        fig_marginal.add_trace(
+            go.Histogram(
+                x=prod_feat_vals[:3000],
+                name=f"Prod {selected_window}",
+                opacity=0.6,
+                marker_color="#d62728",
+                histnorm="probability density",
+            )
+        )
+        fig_marginal.update_layout(
+            barmode="overlay",
+            title=f"Empirical Density Shift for '{top_feat}'",
+            xaxis_title=top_feat,
+            yaxis_title="Density",
+        )
         st.plotly_chart(fig_marginal, use_container_width=True)
 
     with col_dist2:
         st.markdown("##### 📌 Per-Feature Attribution Breakdown")
         rank_data = []
         for feat, sumry in attr_rep.feature_summaries.items():
-            rank_data.append({
-                "Rank": sumry.rank,
-                "Feature": feat,
-                "Root-Cause Score": round(sumry.root_cause_score, 4),
-                "SHAP Delta Mean": round(sumry.shap_delta_mean, 4),
-                "Causal Gap Closure": f"{sumry.causal_pred_recovery*100:.1f}%",
-                "PSI": round(sumry.psi_value, 4),
-            })
+            rank_data.append(
+                {
+                    "Rank": sumry.rank,
+                    "Feature": feat,
+                    "Root-Cause Score": round(sumry.root_cause_score, 4),
+                    "SHAP Delta Mean": round(sumry.shap_delta_mean, 4),
+                    "Causal Gap Closure": f"{sumry.causal_pred_recovery*100:.1f}%",
+                    "PSI": round(sumry.psi_value, 4),
+                }
+            )
         st.dataframe(pd.DataFrame(rank_data).sort_values(by="Rank").head(8), use_container_width=True, hide_index=True)
 
 # -------------------------------------------------------------
@@ -272,12 +367,12 @@ with tab3:
     st.subheader("🧪 Live Controlled Drift Injection & Stress-Testing Lab")
     st.markdown(
         """
-        Inject synthetic, mathematical drift into any individual feature in the clean held-out validation set.
+        Inject synthetic, mathematical drift into any individual feature in the **unseen clean held-out validation set**.
         Then observe whether the **Detection** and **Attribution** layers correctly isolate that exact feature as the top causal driver.
         """
     )
 
-    clean_test_df = ref_df.sample(n=min(5000, len(ref_df)), random_state=123).reset_index(drop=True)
+    clean_test_df = fresh_heldout
 
     col_ctrl1, col_ctrl2, col_ctrl3 = st.columns(3)
     with col_ctrl1:
@@ -285,7 +380,12 @@ with tab3:
     with col_ctrl2:
         inject_type_str = st.selectbox(
             "Drift Transformation Type",
-            ["Mean Shift (+k * std)", "Variance Scaling (k * var)", "Nonlinear Power Transform (x^k)", "Categorical Swap"],
+            [
+                "Mean Shift (+k * std)",
+                "Variance Scaling (k * var)",
+                "Nonlinear Power Transform (x^k)",
+                "Categorical Swap",
+            ],
             index=0,
         )
         type_mapping = {
@@ -315,38 +415,66 @@ with tab3:
             prod_predictions=sim_preds,
             prod_uncertainties=sim_uncs,
         )
-        sim_attr = attributor.attribute_drift(scenario.drifted_df, drift_report=sim_rep, target_col=model.target_col)
+        sim_attr = attributor.attribute_drift(
+            scenario.drifted_df,
+            drift_report=sim_rep,
+            target_col=model.target_col if use_delayed_labels else None,
+        )
 
-        is_success = (sim_attr.top_root_cause_feature == inject_feature)
-        
+        is_success = sim_attr.top_root_cause_feature == inject_feature
+
         st.markdown("---")
         if is_success:
-            st.success(f"🎉 **VALIDATION SUCCESS!** Ground truth injected feature `{inject_feature}` was correctly identified as the #1 Root Cause (Rank 1).")
+            st.success(
+                f"🎉 **VALIDATION SUCCESS!** Ground truth injected feature `{inject_feature}` was correctly identified as the #1 Root Cause (Rank 1)."
+            )
         else:
-            st.warning(f"⚠️ **ATTRIBUTION MISMATCH:** Injected feature was `{inject_feature}`, but top attributed feature was `{sim_attr.top_root_cause_feature}` (Injected feature ranked #{sim_attr.feature_summaries[inject_feature].rank}).")
+            st.warning(
+                f"⚠️ **ATTRIBUTION MISMATCH:** Injected feature was `{inject_feature}`, but top attributed feature was `{sim_attr.top_root_cause_feature}` (Injected feature ranked #{sim_attr.feature_summaries[inject_feature].rank})."
+            )
 
-        st.markdown(f"**Experiment Summary:** {scenario.description} | Detected PSI: `{sim_rep.feature_metrics[inject_feature].psi_value:.4f}` | Alert: `{sim_rep.overall_status}`")
+        st.markdown(
+            f"**Experiment Summary:** {scenario.description} | Detected PSI: `{sim_rep.feature_metrics[inject_feature].psi_value:.4f}` | Alert: `{sim_rep.overall_status}`"
+        )
 
         c_exp1, c_exp2 = st.columns(2)
         with c_exp1:
             st.markdown("##### Attribution Rankings")
             exp_ranks = []
             for feat, s in sim_attr.feature_summaries.items():
-                exp_ranks.append({
-                    "Rank": s.rank,
-                    "Feature": feat,
-                    "Injected Target?": "🎯 YES" if feat == inject_feature else "",
-                    "Attribution Score": round(s.root_cause_score, 4),
-                    "SHAP Share": f"{s.shap_relative_share*100:.1f}%",
-                    "Causal Recovery": f"{s.causal_pred_recovery*100:.1f}%",
-                })
+                exp_ranks.append(
+                    {
+                        "Rank": s.rank,
+                        "Feature": feat,
+                        "Injected Target?": "🎯 YES" if feat == inject_feature else "",
+                        "Attribution Score": round(s.root_cause_score, 4),
+                        "SHAP Share": f"{s.shap_relative_share*100:.1f}%",
+                        "Causal Recovery": f"{s.causal_pred_recovery*100:.1f}%",
+                    }
+                )
             st.dataframe(pd.DataFrame(exp_ranks).sort_values(by="Rank").head(6), use_container_width=True, hide_index=True)
 
         with c_exp2:
             st.markdown(f"##### Injected Feature Shift: `{inject_feature}`")
             fig_sim = go.Figure()
-            fig_sim.add_trace(go.Histogram(x=clean_test_df[inject_feature][:2000], name="Clean Reference", opacity=0.6, marker_color="#1f77b4", histnorm="probability density"))
-            fig_sim.add_trace(go.Histogram(x=scenario.drifted_df[inject_feature][:2000], name="Synthetic Drifted", opacity=0.6, marker_color="#e377c2", histnorm="probability density"))
+            fig_sim.add_trace(
+                go.Histogram(
+                    x=clean_test_df[inject_feature][:2000],
+                    name="Clean Held-Out",
+                    opacity=0.6,
+                    marker_color="#1f77b4",
+                    histnorm="probability density",
+                )
+            )
+            fig_sim.add_trace(
+                go.Histogram(
+                    x=scenario.drifted_df[inject_feature][:2000],
+                    name="Synthetic Drifted",
+                    opacity=0.6,
+                    marker_color="#e377c2",
+                    histnorm="probability density",
+                )
+            )
             fig_sim.update_layout(barmode="overlay", title=f"Distribution Shift: {inject_feature}")
             st.plotly_chart(fig_sim, use_container_width=True)
 
@@ -362,10 +490,21 @@ with tab4:
         """
     )
 
+    records_csv = root_dir / "assets" / "benchmark_experiment_records.csv"
     col_m1, col_m2, col_m3 = st.columns(3)
-    col_m1.metric("Unified Engine Precision@1", "91.7%", "+25.0% vs SHAP-only")
-    col_m2.metric("Unified Engine Recall@3", "100.0%", "Perfect Top-3 coverage")
-    col_m3.metric("Unified Engine MRR", "0.958", "Mean Reciprocal Rank")
+    if records_csv.exists():
+        bench_df = pd.read_csv(records_csv)
+        p1_u = bench_df["is_top1_correct_unified"].mean() * 100
+        p1_s = bench_df["is_top1_correct_shap"].mean() * 100
+        r3_u = bench_df["is_top3_hit_unified"].mean() * 100
+        mrr_u = (1.0 / bench_df["rank_unified"]).mean()
+        col_m1.metric("Unified Engine Precision@1", f"{p1_u:.1f}%", f"{p1_u - p1_s:+.1f}% vs SHAP-only")
+        col_m2.metric("Unified Engine Recall@3", f"{r3_u:.1f}%", f"N = {len(bench_df)} experiments")
+        col_m3.metric("Unified Engine MRR", f"{mrr_u:.3f}", "Mean Reciprocal Rank")
+    else:
+        col_m1.metric("Unified Engine Precision@1", "N/A", "Run generate_assets.py")
+        col_m2.metric("Unified Engine Recall@3", "N/A", "Run generate_assets.py")
+        col_m3.metric("Unified Engine MRR", "N/A", "Run generate_assets.py")
 
     st.markdown("---")
 

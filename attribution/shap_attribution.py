@@ -1,37 +1,12 @@
 """
 SHAP Distribution Shift Decomposition.
-
-Mathematical & Statistical Foundations:
----------------------------------------
-SHAP (SHapley Additive exPlanations) decomposes any model prediction f(x) into an additive
-sum of feature attribution values phi_j(x) and a base expected value phi_0:
-    f(x) = phi_0 + sum_{j=1}^M phi_j(x)
-
-Taking expectations across two distinct populations (Reference W_ref and Production W_prod):
-    E_prod[f(X)] = phi_0 + sum_{j=1}^M E_prod[phi_j(X)]
-    E_ref[f(X)]  = phi_0 + sum_{j=1}^M E_ref[phi_j(X)]
-
-Subtracting yields the Exact Additive Shift Decomposition:
-    Delta E[f(X)] = E_prod[f(X)] - E_ref[f(X)] = sum_{j=1}^M ( E_prod[phi_j(X)] - E_ref[phi_j(X)] )
-                  = sum_{j=1}^M Delta bar{phi}_j
-
-Why SHAP Shift is Useful:
-- It isolates how the model's internal decision logic routes the shifted input distribution.
-- It is mathematically exact in terms of expectation additivity.
-
-Why SHAP Shift ALONE is Insufficient:
-1. Confounding and Collinearity: If Feature A shifts, correlated Feature B will often register
-   a significant SHAP shift even though Feature B's underlying data generating process was untouched.
-2. Explains Predictions, Not Causal Error: A feature may cause huge SHAP shift in an accurate,
-   well-calibrated sub-manifold, while a subtle un-attributed feature shift breaks downstream loss.
 """
 
 from dataclasses import dataclass
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
-from scipy import stats
 import shap
 
 from detection.statistical_tests import calculate_wasserstein_distance, calculate_psi_numerical
@@ -46,11 +21,11 @@ class SHAPAttributionResult:
     base_value: float
     ref_mean_shaps: Dict[str, float]
     prod_mean_shaps: Dict[str, float]
-    delta_mean_shaps: Dict[str, float]  # Delta bar{phi}_j
-    relative_attribution_share: Dict[str, float]  # |Delta phi_j| / sum |Delta phi_k|
-    shap_wasserstein_dists: Dict[str, float]  # W1(P(phi_j|ref), P(phi_j|prod))
+    delta_mean_shaps: Dict[str, float]
+    relative_attribution_share: Dict[str, float]
+    shap_wasserstein_dists: Dict[str, float]
     shap_psi_values: Dict[str, float]
-    ranked_features: List[Tuple[str, float]]  # sorted by attribution importance
+    ranked_features: List[Tuple[str, float]]
 
 
 class SHAPDriftAttributor:
@@ -58,9 +33,10 @@ class SHAPDriftAttributor:
     Computes SHAP value distribution shifts between reference and production windows.
     """
 
-    def __init__(self, model_wrapper, max_samples: int = 1500):
+    def __init__(self, model_wrapper, max_samples: int = 1500, random_state: int = 42):
         self.model_wrapper = model_wrapper
         self.max_samples = max_samples
+        self.random_state = random_state
         self.explainer: Optional[shap.TreeExplainer] = None
         self.ref_shap_values: Optional[np.ndarray] = None
         self.ref_features_df: Optional[pd.DataFrame] = None
@@ -72,32 +48,31 @@ class SHAPDriftAttributor:
         X_ref = ref_df[features].copy()
 
         if len(X_ref) > self.max_samples:
-            X_ref = X_ref.sample(n=self.max_samples, random_state=42).reset_index(drop=True)
+            X_ref = X_ref.sample(n=self.max_samples, random_state=self.random_state).reset_index(drop=True)
 
         self.ref_features_df = X_ref
         logger.info("Initializing TreeExplainer on %d reference samples...", len(X_ref))
         self.explainer = shap.TreeExplainer(self.model_wrapper.model)
-        self.ref_shap_values = self.explainer.shap_values(X_ref)
+        self.ref_shap_values = np.asarray(self.explainer.shap_values(X_ref), dtype=float)
         self.is_fitted = True
         return self
 
     def attribute(self, prod_df: pd.DataFrame) -> SHAPAttributionResult:
         """Decomposes the prediction shift into per-feature SHAP distribution shifts."""
-        if not self.is_fitted or self.explainer is None:
+        if not self.is_fitted or self.explainer is None or self.ref_shap_values is None:
             raise RuntimeError("SHAPDriftAttributor must be fitted on reference data first.")
 
         features = self.model_wrapper.features
         X_prod = prod_df[features].copy()
 
         if len(X_prod) > self.max_samples:
-            X_prod = X_prod.sample(n=self.max_samples, random_state=42).reset_index(drop=True)
+            X_prod = X_prod.sample(n=self.max_samples, random_state=self.random_state).reset_index(drop=True)
 
-        prod_shap_values = self.explainer.shap_values(X_prod)
+        prod_shap_values = np.asarray(self.explainer.shap_values(X_prod), dtype=float)
 
-        # Baseline expected value
-        base_val = float(self.explainer.expected_value) if np.isscalar(self.explainer.expected_value) else float(self.explainer.expected_value[0])
+        exp_val = np.asarray(self.explainer.expected_value).ravel()
+        base_val = float(exp_val[0])
 
-        # Compute empirical predictions
         ref_pred_mean = float(np.mean(self.model_wrapper.predict(self.ref_features_df)))
         prod_pred_mean = float(np.mean(self.model_wrapper.predict(X_prod)))
         delta_expected_pred = prod_pred_mean - ref_pred_mean
@@ -120,15 +95,14 @@ class SHAPDriftAttributor:
             prod_mean_shaps[feat] = p_m
             delta_mean_shaps[feat] = d_m
 
-            # Distributional shape distance on SHAP values
             shap_wass[feat] = calculate_wasserstein_distance(ref_phi, prod_phi)
             psi_res = calculate_psi_numerical(ref_phi, prod_phi, n_bins=10)
             shap_psi[feat] = psi_res.psi_value
 
-        # Calculate relative attribution share based on absolute delta mean + wasserstein energy
+        # Combine expectation shift with distributional 1-Wasserstein energy (both in target $ units)
         abs_deltas = {f: abs(delta_mean_shaps[f]) + 0.5 * shap_wass[f] for f in features}
-        total_energy = sum(abs_deltas.values()) + 1e-6
-        relative_share = {f: val / total_energy for f, val in abs_deltas.items()}
+        total_energy = sum(abs_deltas.values()) + 1e-8
+        relative_share = {f: float(val / total_energy) for f, val in abs_deltas.items()}
 
         ranked = sorted(relative_share.items(), key=lambda x: x[1], reverse=True)
 

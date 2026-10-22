@@ -6,16 +6,16 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import pandas as pd
 
-from .drift_injector import SyntheticDriftInjector, DriftType, InjectedDriftScenario
+from .drift_injector import SyntheticDriftInjector, DriftType
 from data.download import generate_synthetic_taxi_fallback
 from detection.detector import DriftDetector
-from attribution.ranker import DriftAttributionEngine, UnifiedAttributionReport
+from attribution.ranker import DriftAttributionEngine
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,6 @@ class SingleExperimentResult:
     magnitude: float
     psi_detected: float
     is_alert_triggered: bool
-    # Predictions
     top1_unified: str
     top3_unified: List[str]
     rank_unified: int
@@ -38,14 +37,12 @@ class SingleExperimentResult:
     top1_causal: str
     top3_causal: List[str]
     rank_causal: int
-    # Accuracy flags
     is_top1_correct_unified: bool
     is_top3_hit_unified: bool
     is_top1_correct_shap: bool
     is_top3_hit_shap: bool
     is_top1_correct_causal: bool
     is_top3_hit_causal: bool
-    # Plain baseline: rank features by their own PSI (no model, no SHAP)
     top1_psi: str = ""
     rank_psi: int = 0
     is_top1_correct_psi: bool = False
@@ -76,7 +73,6 @@ def make_fresh_heldout(pipeline, n_samples: int = 4000, random_seed: int = 777) 
     """
     Builds a clean evaluation window the model never saw: a new draw from the synthetic
     generator with a different seed, transformed with the already-fitted pipeline.
-    Note: the generator seeds NumPy's global random state.
     """
     raw = generate_synthetic_taxi_fallback(n_samples_per_window=n_samples, n_windows=1, random_seed=random_seed)
     return pipeline.transform(raw["W0_reference"])
@@ -111,12 +107,6 @@ class AttributionBenchmarkRunner:
     ) -> BenchmarkEvaluationResult:
         """
         Runs comprehensive test grid across features, drift types, and magnitudes.
-
-        Fair-comparison defaults:
-        - use_labels=False: attribution never sees the true tip amounts (zero-label setting).
-        - rank_all_features=True: every method ranks all model features, instead of the
-          detector's short list of flagged features. This keeps the comparison equal.
-        Pass use_labels=True and rank_all_features=False to reproduce the original setup.
         """
         features = features_to_test or [
             "trip_distance",
@@ -132,14 +122,18 @@ class AttributionBenchmarkRunner:
         dtypes = drift_types or [DriftType.MEAN_SHIFT, DriftType.VARIANCE_SCALE, DriftType.NONLINEAR_TRANSFORM]
 
         results: List[SingleExperimentResult] = []
-        logger.info("Starting Attribution Benchmark: %d features x %d magnitudes x %d drift types...", len(features), len(mags), len(dtypes))
+        logger.info(
+            "Starting Attribution Benchmark: %d features x %d magnitudes x %d drift types...",
+            len(features),
+            len(mags),
+            len(dtypes),
+        )
 
         for feat in features:
             if feat not in heldout_clean_df.columns:
                 continue
 
             for dt in dtypes:
-                # Skip incompatible combinations
                 if dt == DriftType.NONLINEAR_TRANSFORM and feat in ("payment_type", "passenger_count"):
                     continue
 
@@ -151,7 +145,6 @@ class AttributionBenchmarkRunner:
                         magnitude=mag,
                     )
 
-                    # 1. Run Detection
                     preds = self.model_wrapper.predict(scenario.drifted_df)
                     uncs = self.model_wrapper.estimate_uncertainty(scenario.drifted_df)
                     drift_report = self.detector.inspect_window(
@@ -161,35 +154,44 @@ class AttributionBenchmarkRunner:
                         prod_uncertainties=uncs,
                     )
 
-                    psi_val = drift_report.feature_metrics[feat].psi_value if feat in drift_report.feature_metrics else 0.0
+                    psi_val = (
+                        drift_report.feature_metrics[feat].psi_value
+                        if feat in drift_report.feature_metrics
+                        else 0.0
+                    )
                     is_alert = drift_report.overall_status in ("WARNING", "CRITICAL")
 
-                    # 2. Run Attribution Engine
                     attr_report = self.attributor.attribute_drift(
                         prod_df=scenario.drifted_df,
                         drift_report=None if rank_all_features else drift_report,
                         target_col=self.model_wrapper.target_col if use_labels else None,
                     )
 
-                    # PSI baseline ranking: which feature moved the most by its own PSI
-                    psi_ranks = [k for k, _ in sorted(
-                        drift_report.feature_metrics.items(), key=lambda kv: kv[1].psi_value, reverse=True
-                    )]
+                    psi_ranks = [
+                        k
+                        for k, _ in sorted(
+                            drift_report.feature_metrics.items(),
+                            key=lambda kv: kv[1].psi_value,
+                            reverse=True,
+                        )
+                    ]
                     rank_p = psi_ranks.index(feat) + 1 if feat in psi_ranks else len(psi_ranks)
 
-                    # Extract Unified Ranking
-                    unified_ranks = [k for k, _ in sorted(attr_report.root_cause_scores.items(), key=lambda x: x[1], reverse=True)]
+                    unified_ranks = [
+                        k
+                        for k, _ in sorted(
+                            attr_report.root_cause_scores.items(), key=lambda x: x[1], reverse=True
+                        )
+                    ]
                     top1_u = unified_ranks[0]
                     top3_u = unified_ranks[:3]
                     rank_u = unified_ranks.index(feat) + 1 if feat in unified_ranks else len(unified_ranks)
 
-                    # Extract SHAP Ranking
                     shap_ranks = [k for k, _ in attr_report.shap_attribution.ranked_features]
                     top1_s = shap_ranks[0]
                     top3_s = shap_ranks[:3]
                     rank_s = shap_ranks.index(feat) + 1 if feat in shap_ranks else len(shap_ranks)
 
-                    # Extract Causal Ablation Ranking
                     causal_ranks = [k for k, _ in attr_report.causal_ablation.ranked_causal_features]
                     top1_c = causal_ranks[0]
                     top3_c = causal_ranks[:3]
@@ -227,7 +229,6 @@ class AttributionBenchmarkRunner:
         records_df = pd.DataFrame([vars(r) for r in results])
         n_total = len(records_df)
 
-        # Metrics computation
         p1_u = float(records_df["is_top1_correct_unified"].mean())
         r3_u = float(records_df["is_top3_hit_unified"].mean())
         mrr_u = float((1.0 / records_df["rank_unified"]).mean())
@@ -244,31 +245,49 @@ class AttributionBenchmarkRunner:
         r3_p = float(records_df["is_top3_hit_psi"].mean())
         mrr_p = float((1.0 / records_df["rank_psi"]).mean())
 
-        summary_feat = records_df.groupby("target_feature").agg({
-            "is_top1_correct_unified": "mean",
-            "is_top3_hit_unified": "mean",
-            "rank_unified": "mean",
-            "psi_detected": "mean",
-        }).reset_index().rename(columns={
-            "is_top1_correct_unified": "Precision@1",
-            "is_top3_hit_unified": "Recall@3",
-            "rank_unified": "Avg_Rank",
-            "psi_detected": "Avg_PSI",
-        })
+        summary_feat = (
+            records_df.groupby("target_feature")
+            .agg(
+                {
+                    "is_top1_correct_unified": "mean",
+                    "is_top3_hit_unified": "mean",
+                    "rank_unified": "mean",
+                    "psi_detected": "mean",
+                }
+            )
+            .reset_index()
+            .rename(
+                columns={
+                    "is_top1_correct_unified": "Precision@1",
+                    "is_top3_hit_unified": "Recall@3",
+                    "rank_unified": "Avg_Rank",
+                    "psi_detected": "Avg_PSI",
+                }
+            )
+        )
 
-        summary_mag = records_df.groupby("magnitude").agg({
-            "is_top1_correct_unified": "mean",
-            "is_top1_correct_shap": "mean",
-            "is_top1_correct_causal": "mean",
-            "is_top1_correct_psi": "mean",
-            "is_top3_hit_unified": "mean",
-        }).reset_index().rename(columns={
-            "is_top1_correct_unified": "Unified_Precision@1",
-            "is_top1_correct_shap": "SHAP_Precision@1",
-            "is_top1_correct_causal": "Causal_Precision@1",
-            "is_top1_correct_psi": "PSI_Precision@1",
-            "is_top3_hit_unified": "Recall@3",
-        })
+        summary_mag = (
+            records_df.groupby("magnitude")
+            .agg(
+                {
+                    "is_top1_correct_unified": "mean",
+                    "is_top1_correct_shap": "mean",
+                    "is_top1_correct_causal": "mean",
+                    "is_top1_correct_psi": "mean",
+                    "is_top3_hit_unified": "mean",
+                }
+            )
+            .reset_index()
+            .rename(
+                columns={
+                    "is_top1_correct_unified": "Unified_Precision@1",
+                    "is_top1_correct_shap": "SHAP_Precision@1",
+                    "is_top1_correct_causal": "Causal_Precision@1",
+                    "is_top1_correct_psi": "PSI_Precision@1",
+                    "is_top3_hit_unified": "Recall@3",
+                }
+            )
+        )
 
         logger.info("=== BENCHMARK SUMMARY (N=%d) ===", n_total)
         logger.info("Unified Engine -> Precision@1: %.2f%%, Recall@3: %.2f%%, MRR: %.4f", p1_u * 100, r3_u * 100, mrr_u)
@@ -303,7 +322,6 @@ class AttributionBenchmarkRunner:
     ) -> Dict[str, float]:
         """
         Feeds clean, undrifted chunks to the detector and reports how often it raises an alert.
-        Every alert here is a false alarm.
         """
         n_alerts = 0
         n_critical = 0
@@ -332,39 +350,73 @@ def generate_benchmark_visualizations(
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     saved_paths = []
 
-    sns.set_theme(style="whitegrid", font_scale=1.1)
-    
+    sns.set_theme(style="whitegrid", font_scale=1.05)
+
     # 1. Overall Method Comparison Chart
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    metrics_data = pd.DataFrame({
-        "Method": ["Unified Engine\n(SHAP + Causal)", "Causal Ablation\n(Interventional)", "SHAP Shift\n(Observational)"],
-        "Precision@1": [bench_result.precision_at_1_unified * 100, bench_result.precision_at_1_causal * 100, bench_result.precision_at_1_shap * 100],
-        "Recall@3": [bench_result.recall_at_3_unified * 100, bench_result.recall_at_3_causal * 100, bench_result.recall_at_3_shap * 100],
-        "MRR": [bench_result.mrr_unified, bench_result.mrr_causal, bench_result.mrr_shap],
-    })
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+    metrics_data = pd.DataFrame(
+        {
+            "Method": [
+                "Unified Engine\n(SHAP + Causal)",
+                "Causal Ablation\n(Interventional)",
+                "SHAP Shift\n(Observational)",
+                "PSI Ranking\n(Baseline)",
+            ],
+            "Precision@1": [
+                bench_result.precision_at_1_unified * 100,
+                bench_result.precision_at_1_causal * 100,
+                bench_result.precision_at_1_shap * 100,
+                bench_result.precision_at_1_psi * 100,
+            ],
+            "Recall@3": [
+                bench_result.recall_at_3_unified * 100,
+                bench_result.recall_at_3_causal * 100,
+                bench_result.recall_at_3_shap * 100,
+                bench_result.recall_at_3_psi * 100,
+            ],
+            "MRR": [
+                bench_result.mrr_unified,
+                bench_result.mrr_causal,
+                bench_result.mrr_shap,
+                bench_result.mrr_psi,
+            ],
+        }
+    )
 
-    palette = ["#1f77b4", "#2ca02c", "#ff7f0e"]
+    palette = ["#1f77b4", "#2ca02c", "#ff7f0e", "#7f7f7f"]
 
-    # Precision@1 plot
-    sns.barplot(data=metrics_data, x="Method", y="Precision@1", ax=axes[0], palette=palette)
+    sns.barplot(data=metrics_data, x="Method", y="Precision@1", hue="Method", ax=axes[0], palette=palette, legend=False)
     axes[0].set_title("Top-1 Root Cause Precision (%)", weight="bold")
-    axes[0].set_ylim(0, 105)
+    axes[0].set_ylim(0, 108)
     for p in axes[0].patches:
-        axes[0].annotate(f"{p.get_height():.1f}%", (p.get_x() + p.get_width() / 2., p.get_height() + 1.5), ha='center', weight='bold')
+        axes[0].annotate(
+            f"{p.get_height():.1f}%",
+            (p.get_x() + p.get_width() / 2.0, p.get_height() + 1.5),
+            ha="center",
+            weight="bold",
+        )
 
-    # Recall@3 plot
-    sns.barplot(data=metrics_data, x="Method", y="Recall@3", ax=axes[1], palette=palette)
+    sns.barplot(data=metrics_data, x="Method", y="Recall@3", hue="Method", ax=axes[1], palette=palette, legend=False)
     axes[1].set_title("Top-3 Root Cause Recall (%)", weight="bold")
-    axes[1].set_ylim(0, 105)
+    axes[1].set_ylim(0, 108)
     for p in axes[1].patches:
-        axes[1].annotate(f"{p.get_height():.1f}%", (p.get_x() + p.get_width() / 2., p.get_height() + 1.5), ha='center', weight='bold')
+        axes[1].annotate(
+            f"{p.get_height():.1f}%",
+            (p.get_x() + p.get_width() / 2.0, p.get_height() + 1.5),
+            ha="center",
+            weight="bold",
+        )
 
-    # MRR plot
-    sns.barplot(data=metrics_data, x="Method", y="MRR", ax=axes[2], palette=palette)
+    sns.barplot(data=metrics_data, x="Method", y="MRR", hue="Method", ax=axes[2], palette=palette, legend=False)
     axes[2].set_title("Mean Reciprocal Rank (MRR)", weight="bold")
-    axes[2].set_ylim(0, 1.05)
+    axes[2].set_ylim(0, 1.08)
     for p in axes[2].patches:
-        axes[2].annotate(f"{p.get_height():.3f}", (p.get_x() + p.get_width() / 2., p.get_height() + 0.02), ha='center', weight='bold')
+        axes[2].annotate(
+            f"{p.get_height():.3f}",
+            (p.get_x() + p.get_width() / 2.0, p.get_height() + 0.02),
+            ha="center",
+            weight="bold",
+        )
 
     plt.tight_layout()
     chart1_path = os.path.join(save_dir, "synthetic_validation_benchmark.png")
@@ -378,22 +430,25 @@ def generate_benchmark_visualizations(
     mag_melted = pd.melt(
         mag_df,
         id_vars=["magnitude"],
-        value_vars=["Unified_Precision@1", "Causal_Precision@1", "SHAP_Precision@1"],
+        value_vars=["Unified_Precision@1", "Causal_Precision@1", "SHAP_Precision@1", "PSI_Precision@1"],
         var_name="Method",
         value_name="Precision",
     )
     mag_melted["Precision"] *= 100.0
-    mag_melted["Method"] = mag_melted["Method"].map({
-        "Unified_Precision@1": "Unified Engine (SHAP + Causal)",
-        "Causal_Precision@1": "Causal Counterfactual Ablation",
-        "SHAP_Precision@1": "SHAP Shift Decomposition",
-    })
+    mag_melted["Method"] = mag_melted["Method"].map(
+        {
+            "Unified_Precision@1": "Unified Engine (SHAP + Causal)",
+            "Causal_Precision@1": "Causal Counterfactual Ablation",
+            "SHAP_Precision@1": "SHAP Shift Decomposition",
+            "PSI_Precision@1": "PSI Ranking Baseline",
+        }
+    )
 
     sns.lineplot(data=mag_melted, x="magnitude", y="Precision", hue="Method", marker="o", linewidth=2.5, ax=ax)
     ax.set_title("Root-Cause Attribution Precision@1 vs. Injected Drift Magnitude", weight="bold")
     ax.set_xlabel("Injected Drift Magnitude (Standard Deviations / Multiplier)", weight="bold")
     ax.set_ylabel("Precision@1 (%)", weight="bold")
-    ax.set_ylim(40, 105)
+    ax.set_ylim(0, 105)
     plt.tight_layout()
     chart2_path = os.path.join(save_dir, "precision_vs_magnitude.png")
     fig.savefig(chart2_path, dpi=200)

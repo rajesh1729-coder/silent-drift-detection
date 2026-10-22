@@ -5,7 +5,7 @@ Synthetic Drift Injector for Ground-Truth Controlled Experiments.
 from dataclasses import dataclass
 from enum import Enum
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Optional
 import numpy as np
 import pandas as pd
 
@@ -51,12 +51,6 @@ class SyntheticDriftInjector:
     ) -> InjectedDriftScenario:
         """
         Injects a known mathematical drift into target_feature of clean_df.
-        
-        Parameters:
-            clean_df: Baseline clean held-out dataset.
-            target_feature: Column name to distort.
-            drift_type: Transformation mode.
-            magnitude: Multiplier / standard deviation scale.
         """
         if target_feature not in clean_df.columns:
             raise ValueError(f"Feature '{target_feature}' not found in input dataframe.")
@@ -65,42 +59,42 @@ class SyntheticDriftInjector:
         raw_vals = drifted[target_feature].to_numpy().copy()
         n_samples = len(raw_vals)
 
-        std_val = float(np.std(raw_vals)) if np.issubdtype(raw_vals.dtype, np.number) else 1.0
-        mean_val = float(np.mean(raw_vals)) if np.issubdtype(raw_vals.dtype, np.number) else 0.0
+        is_num = np.issubdtype(raw_vals.dtype, np.number)
+        std_val = float(np.std(raw_vals)) if is_num else 1.0
+        mean_val = float(np.mean(raw_vals)) if is_num else 0.0
+        lower_bound = 0.0 if (is_num and np.min(raw_vals) >= 0.0) else None
 
         if drift_type == DriftType.MEAN_SHIFT:
-            # Shift mean by magnitude * standard deviations
             shift_amount = magnitude * (std_val if std_val > 1e-4 else 1.0)
-            drifted[target_feature] = np.clip(raw_vals + shift_amount, 0.0, None)
+            shifted = raw_vals + shift_amount
+            drifted[target_feature] = np.clip(shifted, lower_bound, None) if lower_bound is not None else shifted
             desc = f"Mean shift on '{target_feature}' by +{magnitude:.2f} sigma (+{shift_amount:.2f})"
 
         elif drift_type == DriftType.VARIANCE_SCALE:
-            # Scale dispersion around the mean
             scaled = mean_val + magnitude * (raw_vals - mean_val)
-            drifted[target_feature] = np.clip(scaled, 0.0, None)
+            drifted[target_feature] = np.clip(scaled, lower_bound, None) if lower_bound is not None else scaled
             desc = f"Variance scaling on '{target_feature}' by {magnitude:.2f}x"
 
         elif drift_type == DriftType.NONLINEAR_TRANSFORM:
-            # Exponentiate / power distortion
-            normed = (raw_vals - raw_vals.min()) / (raw_vals.max() - raw_vals.min() + 1e-5)
-            warped = (normed ** magnitude) * (raw_vals.max() - raw_vals.min()) + raw_vals.min()
+            span = raw_vals.max() - raw_vals.min()
+            normed = (raw_vals - raw_vals.min()) / (span + 1e-5)
+            warped = (normed ** magnitude) * span + raw_vals.min()
             drifted[target_feature] = warped
             desc = f"Nonlinear power transform on '{target_feature}' with exponent {magnitude:.2f}"
 
         elif drift_type == DriftType.CATEGORICAL_SWAP:
-            # Probability mass redistribution across categories
             cats = np.unique(raw_vals)
             if len(cats) > 1:
-                # Flip 50% * magnitude of the dominant category to rare categories
                 dominant_cat = pd.Series(raw_vals).mode()[0]
                 other_cats = [c for c in cats if c != dominant_cat]
-                mask = (raw_vals == dominant_cat) & (self.rng.uniform(0, 1, size=n_samples) < min(0.9, magnitude * 0.4))
-                raw_vals[mask] = self.rng.choice(other_cats, size=np.sum(mask))
+                mask = (raw_vals == dominant_cat) & (
+                    self.rng.uniform(0, 1, size=n_samples) < min(0.9, magnitude * 0.4)
+                )
+                raw_vals[mask] = self.rng.choice(other_cats, size=int(np.sum(mask)))
                 drifted[target_feature] = raw_vals
             desc = f"Categorical distribution shift on '{target_feature}'"
 
         elif drift_type == DriftType.OUTLIER_CONTAMINATION:
-            # Inject extreme high-leverage outliers into tail
             n_outliers = int(n_samples * min(0.30, 0.05 * magnitude))
             outlier_idx = self.rng.choice(n_samples, size=n_outliers, replace=False)
             extreme_val = mean_val + (magnitude * 4.0 * std_val)

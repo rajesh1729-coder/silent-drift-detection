@@ -3,11 +3,10 @@ Baseline Model Training and Inference with Uncertainty Estimation.
 Uses Gradient Boosted Trees with staged prediction variance estimation.
 """
 
-import os
 import joblib
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor
@@ -54,7 +53,9 @@ class BaselineTaxiModel:
         y_train = train_df[self.target_col]
 
         if val_df is None:
-            X_tr, X_val, y_tr, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X_train, y_train, test_size=0.2, random_state=self.params["random_state"]
+            )
         else:
             X_tr, y_tr = X_train, y_train
             X_val, y_val = val_df[self.features], val_df[self.target_col]
@@ -63,7 +64,6 @@ class BaselineTaxiModel:
         self.model = GradientBoostingRegressor(**self.params)
         self.model.fit(X_tr, y_tr)
 
-        # Baseline evaluation on validation split
         val_preds = self.model.predict(X_val)
         val_rmse = float(np.sqrt(mean_squared_error(y_val, val_preds)))
         val_mae = float(mean_absolute_error(y_val, val_preds))
@@ -77,9 +77,7 @@ class BaselineTaxiModel:
             "std_tip": float(np.std(y_val)),
         }
         self.reference_predictions = val_preds
-        self.reference_residuals = (y_val.to_numpy() - val_preds)
-        
-        # Estimate reference uncertainty
+        self.reference_residuals = y_val.to_numpy() - val_preds
         self.reference_uncertainties = self.estimate_uncertainty(X_val)
 
         logger.info("Baseline validation performance -> RMSE: %.4f, MAE: %.4f, R2: %.4f", val_rmse, val_mae, val_r2)
@@ -94,31 +92,22 @@ class BaselineTaxiModel:
 
     def estimate_uncertainty(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Estimates epistemic prediction uncertainty via staged tree ensemble variance.
-        
-        Statistical principle:
-        For an input vector x, the booster contains T individual decision trees.
-        When x lands in familiar reference space, staged predictions converge smoothly.
-        When x shifts into out-of-distribution / drifted space, trees extrapolate diverge,
-        producing a spike in ensemble standard deviation across stages:
-            sigma_tree(x) = sqrt( 1/T * sum_{t=1}^T (f_t(x) - f_bar(x))^2 )
+        Estimates epistemic prediction uncertainty via staged tree ensemble dispersion.
         """
         if self.model is None:
             raise RuntimeError("Model not initialized.")
 
         X = df[self.features] if isinstance(df, pd.DataFrame) else df
-        # Collect staged predictions sampled across boosting iterations
-        staged_preds = []
-        for idx, p in enumerate(self.model.staged_predict(X)):
-            if idx % max(1, self.model.n_estimators_ // 15) == 0:
-                staged_preds.append(p)
+        step = max(1, self.model.n_estimators_ // 15)
+        staged_preds = [
+            p for idx, p in enumerate(self.model.staged_predict(X)) if idx % step == 0
+        ]
 
         if not staged_preds:
             staged_preds.append(self.model.predict(X))
 
-        staged_matrix = np.array(staged_preds)  # shape (n_stages, n_samples)
-        uncertainty_std = np.std(staged_matrix, axis=0)
-        return uncertainty_std
+        staged_matrix = np.array(staged_preds)
+        return np.std(staged_matrix, axis=0)
 
     def evaluate(self, df: pd.DataFrame) -> Dict[str, float]:
         """Evaluates model performance if ground truth labels are available."""
@@ -134,7 +123,7 @@ class BaselineTaxiModel:
             "std_pred": float(np.std(y_pred)),
         }
 
-    def save(self, filepath: str = "./models/baseline_lgb_model.joblib") -> None:
+    def save(self, filepath: str = "./models/baseline_gb_model.joblib") -> None:
         """Serializes model and metadata to disk."""
         path = Path(filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -150,7 +139,7 @@ class BaselineTaxiModel:
         logger.info("Saved baseline model artifact to %s", filepath)
 
     @classmethod
-    def load(cls, filepath: str = "./models/baseline_lgb_model.joblib") -> "BaselineTaxiModel":
+    def load(cls, filepath: str = "./models/baseline_gb_model.joblib") -> "BaselineTaxiModel":
         """Loads serialized model artifact."""
         payload = joblib.load(filepath)
         instance = cls(features=payload["features"], target_col=payload["target_col"])
@@ -163,7 +152,7 @@ class BaselineTaxiModel:
 
 def train_baseline_model(
     reference_df: pd.DataFrame,
-    model_save_path: str = "./models/baseline_lgb_model.joblib",
+    model_save_path: str = "./models/baseline_gb_model.joblib",
 ) -> BaselineTaxiModel:
     """Convenience function to train and save the baseline model on reference data."""
     model = BaselineTaxiModel()
