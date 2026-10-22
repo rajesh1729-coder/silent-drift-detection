@@ -128,7 +128,7 @@ with tab1:
     col1, col2, col3, col4 = st.columns(4)
     status_color = "🔴" if drift_rep.overall_status == "CRITICAL" else ("🟡" if drift_rep.overall_status == "WARNING" else "🟢")
     col1.metric("Overall Alert Status", f"{status_color} {drift_rep.overall_status}")
-    col2.metric("Drifted Features (PSI ≥ 0.10)", f"{drift_rep.n_drifted_features} / {len(drift_rep.feature_metrics)}")
+    col2.metric("Flagged Features (PSI or KS)", f"{drift_rep.n_drifted_features} / {len(drift_rep.feature_metrics)}")
     
     unc_ratio = drift_rep.uncertainty_report.uncertainty_mean_ratio if drift_rep.uncertainty_report else 1.0
     col3.metric("Epistemic Uncertainty Shift", f"{unc_ratio:.2f}x Baseline")
@@ -174,7 +174,7 @@ with tab1:
             "PSI Status": met.psi_status,
             "KS Statistic": round(met.ks_statistic, 4),
             "KS p-value": f"{met.ks_pvalue:.2e}",
-            "FDR Sig (q < 0.01)": "✅ Yes" if met.ks_fdr_significant else "❌ No",
+            "FDR Sig (q < 0.01)": ("n/a" if met.feature_type == "categorical" else ("✅ Yes" if met.ks_fdr_significant else "❌ No")),
             "Wasserstein Dist": round(met.wasserstein_dist, 4),
             "Overall Status": met.status,
         })

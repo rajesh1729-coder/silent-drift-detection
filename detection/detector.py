@@ -33,6 +33,22 @@ class FeatureDriftMetric:
     ks_fdr_qvalue: float
     wasserstein_dist: float
     status: str  # "STABLE", "WARNING", "CRITICAL"
+    ks_status: str = "STABLE"  # raw KS verdict before FDR gating ("STABLE" for categoricals)
+
+
+def combine_feature_status(psi_status: str, ks_status: str, ks_fdr_significant: bool) -> str:
+    """
+    Decide one feature's final status.
+
+    PSI always counts. The KS verdict only counts if the Benjamini-Hochberg
+    procedure also found that feature's KS test significant.
+    """
+    effective_ks = ks_status if ks_fdr_significant else "STABLE"
+    if "CRITICAL" in (psi_status, effective_ks):
+        return "CRITICAL"
+    if "WARNING" in (psi_status, effective_ks):
+        return "WARNING"
+    return "STABLE"
 
 
 @dataclass
@@ -129,14 +145,6 @@ class DriftDetector:
             raw_pvalues[feat] = ks_pval
             wass_dist = calculate_wasserstein_distance(self.ref_data[feat], prod_df[feat])
 
-            # Determine composite feature status
-            if psi_res.status == "CRITICAL" or ks_status == "CRITICAL":
-                feat_status = "CRITICAL"
-            elif psi_res.status == "WARNING" or ks_status == "WARNING":
-                feat_status = "WARNING"
-            else:
-                feat_status = "STABLE"
-
             feature_metrics[feat] = FeatureDriftMetric(
                 feature_name=feat,
                 feature_type="numerical",
@@ -147,15 +155,18 @@ class DriftDetector:
                 ks_fdr_significant=False,  # updated via BH step
                 ks_fdr_qvalue=ks_pval,
                 wasserstein_dist=wass_dist,
-                status=feat_status,
+                status=psi_res.status,  # placeholder, finalized after the BH step
+                ks_status=ks_status,
             )
 
         # 2. Apply Benjamini-Hochberg FDR correction to KS tests
         fdr_results = apply_benjamini_hochberg_correction(raw_pvalues, alpha=self.ks_alpha)
         for feat, (is_sig, q_val) in fdr_results.items():
             if feat in feature_metrics:
-                feature_metrics[feat].ks_fdr_significant = is_sig
-                feature_metrics[feat].ks_fdr_qvalue = q_val
+                m = feature_metrics[feat]
+                m.ks_fdr_significant = is_sig
+                m.ks_fdr_qvalue = q_val
+                m.status = combine_feature_status(m.psi_status, m.ks_status, is_sig)
 
         # 3. Evaluate Categorical Features (Categorical PSI)
         for feat in self.categorical_features:
@@ -184,18 +195,34 @@ class DriftDetector:
             unc_report = self.uncertainty_detector.evaluate(prod_predictions, prod_uncertainties, prod_feat_arr)
 
         # 5. Aggregate Global Alert Status
-        critical_count = sum(1 for m in feature_metrics.values() if m.status == "CRITICAL")
-        warning_count = sum(1 for m in feature_metrics.values() if m.status == "WARNING")
+        critical_feats = [f for f, m in feature_metrics.items() if m.status == "CRITICAL"]
+        warning_feats = [f for f, m in feature_metrics.items() if m.status == "WARNING"]
+        critical_count = len(critical_feats)
+        warning_count = len(warning_feats)
         drifted_total = critical_count + warning_count
+        unc_status = unc_report.alert_status if unc_report else "NORMAL"
 
-        if critical_count > 0 or (unc_report and unc_report.alert_status == "CRITICAL"):
+        def _names(feats: List[str]) -> str:
+            shown = ", ".join(feats[:5])
+            return shown + (f", +{len(feats) - 5} more" if len(feats) > 5 else "")
+
+        if critical_count > 0 or unc_status == "CRITICAL":
             overall_status = "CRITICAL"
-            summary = f"CRITICAL ALERT: {critical_count} features exhibiting severe drift (PSI >= 0.25)."
-            if unc_report and unc_report.alert_status == "CRITICAL":
+            parts = []
+            if critical_count:
+                parts.append(f"{critical_count} critical feature(s): {_names(critical_feats)}")
+            if warning_count:
+                parts.append(f"{warning_count} warning feature(s)")
+            summary = "CRITICAL ALERT: " + ("; ".join(parts) if parts else "model signals only") + "."
+            if unc_status == "CRITICAL":
                 summary += f" Model uncertainty/prediction drift critical ({unc_report.justification})."
-        elif warning_count > 0 or (unc_report and unc_report.alert_status == "WARNING"):
+        elif warning_count > 0 or unc_status == "WARNING":
             overall_status = "WARNING"
-            summary = f"WARNING: {warning_count} features showing moderate covariate shift (0.10 <= PSI < 0.25)."
+            summary = "WARNING:"
+            if warning_count:
+                summary += f" {warning_count} feature(s) with moderate drift: {_names(warning_feats)}."
+            if unc_status == "WARNING":
+                summary += f" Model uncertainty/prediction drift warning ({unc_report.justification})."
         else:
             overall_status = "NORMAL"
             summary = "NOMINAL: All monitored features and uncertainty signals within reference thresholds."
