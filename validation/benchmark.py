@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .drift_injector import SyntheticDriftInjector, DriftType, InjectedDriftScenario
+from data.download import generate_synthetic_taxi_fallback
 from detection.detector import DriftDetector
 from attribution.ranker import DriftAttributionEngine, UnifiedAttributionReport
 
@@ -44,6 +45,11 @@ class SingleExperimentResult:
     is_top3_hit_shap: bool
     is_top1_correct_causal: bool
     is_top3_hit_causal: bool
+    # Plain baseline: rank features by their own PSI (no model, no SHAP)
+    top1_psi: str = ""
+    rank_psi: int = 0
+    is_top1_correct_psi: bool = False
+    is_top3_hit_psi: bool = False
 
 
 @dataclass
@@ -61,6 +67,19 @@ class BenchmarkEvaluationResult:
     experiment_records: pd.DataFrame
     summary_by_feature: pd.DataFrame
     summary_by_magnitude: pd.DataFrame
+    precision_at_1_psi: float = 0.0
+    recall_at_3_psi: float = 0.0
+    mrr_psi: float = 0.0
+
+
+def make_fresh_heldout(pipeline, n_samples: int = 4000, random_seed: int = 777) -> pd.DataFrame:
+    """
+    Builds a clean evaluation window the model never saw: a new draw from the synthetic
+    generator with a different seed, transformed with the already-fitted pipeline.
+    Note: the generator seeds NumPy's global random state.
+    """
+    raw = generate_synthetic_taxi_fallback(n_samples_per_window=n_samples, n_windows=1, random_seed=random_seed)
+    return pipeline.transform(raw["W0_reference"])
 
 
 class AttributionBenchmarkRunner:
@@ -87,9 +106,17 @@ class AttributionBenchmarkRunner:
         features_to_test: Optional[List[str]] = None,
         magnitudes: Optional[List[float]] = None,
         drift_types: Optional[List[DriftType]] = None,
+        use_labels: bool = False,
+        rank_all_features: bool = True,
     ) -> BenchmarkEvaluationResult:
         """
         Runs comprehensive test grid across features, drift types, and magnitudes.
+
+        Fair-comparison defaults:
+        - use_labels=False: attribution never sees the true tip amounts (zero-label setting).
+        - rank_all_features=True: every method ranks all model features, instead of the
+          detector's short list of flagged features. This keeps the comparison equal.
+        Pass use_labels=True and rank_all_features=False to reproduce the original setup.
         """
         features = features_to_test or [
             "trip_distance",
@@ -140,9 +167,15 @@ class AttributionBenchmarkRunner:
                     # 2. Run Attribution Engine
                     attr_report = self.attributor.attribute_drift(
                         prod_df=scenario.drifted_df,
-                        drift_report=drift_report,
-                        target_col=self.model_wrapper.target_col,
+                        drift_report=None if rank_all_features else drift_report,
+                        target_col=self.model_wrapper.target_col if use_labels else None,
                     )
+
+                    # PSI baseline ranking: which feature moved the most by its own PSI
+                    psi_ranks = [k for k, _ in sorted(
+                        drift_report.feature_metrics.items(), key=lambda kv: kv[1].psi_value, reverse=True
+                    )]
+                    rank_p = psi_ranks.index(feat) + 1 if feat in psi_ranks else len(psi_ranks)
 
                     # Extract Unified Ranking
                     unified_ranks = [k for k, _ in sorted(attr_report.root_cause_scores.items(), key=lambda x: x[1], reverse=True)]
@@ -184,6 +217,10 @@ class AttributionBenchmarkRunner:
                         is_top3_hit_shap=(feat in top3_s),
                         is_top1_correct_causal=(top1_c == feat),
                         is_top3_hit_causal=(feat in top3_c),
+                        top1_psi=psi_ranks[0],
+                        rank_psi=rank_p,
+                        is_top1_correct_psi=(psi_ranks[0] == feat),
+                        is_top3_hit_psi=(feat in psi_ranks[:3]),
                     )
                     results.append(exp_res)
 
@@ -203,6 +240,10 @@ class AttributionBenchmarkRunner:
         r3_c = float(records_df["is_top3_hit_causal"].mean())
         mrr_c = float((1.0 / records_df["rank_causal"]).mean())
 
+        p1_p = float(records_df["is_top1_correct_psi"].mean())
+        r3_p = float(records_df["is_top3_hit_psi"].mean())
+        mrr_p = float((1.0 / records_df["rank_psi"]).mean())
+
         summary_feat = records_df.groupby("target_feature").agg({
             "is_top1_correct_unified": "mean",
             "is_top3_hit_unified": "mean",
@@ -219,11 +260,13 @@ class AttributionBenchmarkRunner:
             "is_top1_correct_unified": "mean",
             "is_top1_correct_shap": "mean",
             "is_top1_correct_causal": "mean",
+            "is_top1_correct_psi": "mean",
             "is_top3_hit_unified": "mean",
         }).reset_index().rename(columns={
             "is_top1_correct_unified": "Unified_Precision@1",
             "is_top1_correct_shap": "SHAP_Precision@1",
             "is_top1_correct_causal": "Causal_Precision@1",
+            "is_top1_correct_psi": "PSI_Precision@1",
             "is_top3_hit_unified": "Recall@3",
         })
 
@@ -231,6 +274,7 @@ class AttributionBenchmarkRunner:
         logger.info("Unified Engine -> Precision@1: %.2f%%, Recall@3: %.2f%%, MRR: %.4f", p1_u * 100, r3_u * 100, mrr_u)
         logger.info("SHAP-Only      -> Precision@1: %.2f%%, Recall@3: %.2f%%, MRR: %.4f", p1_s * 100, r3_s * 100, mrr_s)
         logger.info("Causal-Only    -> Precision@1: %.2f%%, Recall@3: %.2f%%, MRR: %.4f", p1_c * 100, r3_c * 100, mrr_c)
+        logger.info("PSI-rank base  -> Precision@1: %.2f%%, Recall@3: %.2f%%, MRR: %.4f", p1_p * 100, r3_p * 100, mrr_p)
 
         return BenchmarkEvaluationResult(
             total_experiments=n_total,
@@ -246,7 +290,38 @@ class AttributionBenchmarkRunner:
             experiment_records=records_df,
             summary_by_feature=summary_feat,
             summary_by_magnitude=summary_mag,
+            precision_at_1_psi=p1_p,
+            recall_at_3_psi=r3_p,
+            mrr_psi=mrr_p,
         )
+
+    def run_no_drift_control(
+        self,
+        clean_df: pd.DataFrame,
+        n_chunks: int = 10,
+        chunk_size: int = 1500,
+    ) -> Dict[str, float]:
+        """
+        Feeds clean, undrifted chunks to the detector and reports how often it raises an alert.
+        Every alert here is a false alarm.
+        """
+        n_alerts = 0
+        n_critical = 0
+        for i in range(n_chunks):
+            chunk = clean_df.sample(n=min(chunk_size, len(clean_df)), random_state=i).reset_index(drop=True)
+            report = self.detector.inspect_window(
+                prod_df=chunk,
+                window_name=f"clean_chunk_{i}",
+                prod_predictions=self.model_wrapper.predict(chunk),
+                prod_uncertainties=self.model_wrapper.estimate_uncertainty(chunk),
+            )
+            n_alerts += int(report.overall_status != "NORMAL")
+            n_critical += int(report.overall_status == "CRITICAL")
+        return {
+            "n_chunks": float(n_chunks),
+            "false_alarm_rate": n_alerts / n_chunks,
+            "false_critical_rate": n_critical / n_chunks,
+        }
 
 
 def generate_benchmark_visualizations(
